@@ -45,7 +45,7 @@ fn fill_floor(layer: &mut LayerBundle) {
     for x in -r..=r {
         for z in -r..=r {
             layer.chunk.set_block([x, ARENA_FLOOR_Y - 1, z], BlockState::BEDROCK);
-            layer.chunk.set_block([x, ARENA_FLOOR_Y, z], BlockState::RED_CONCRETE);
+            layer.chunk.set_block([x, ARENA_FLOOR_Y, z], BlockState::WHITE_TERRACOTTA);
         }
     }
     // Visible centre marker (helps Minecraft clients orient themselves)

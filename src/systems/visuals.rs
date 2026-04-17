@@ -1,25 +1,23 @@
 /// Tank 3-D rendering using Minecraft Display Entities.
 ///
-/// Each player gets a cluster of Block Display entities that form a tank shape,
-/// plus two Text Display entities (name tag and health bar) and one Marker entity
-/// that acts as the camera anchor.
+/// Each player gets:
+///  • 3 BlockDisplay entities  – hull body + two tracks   (rotate with hull_yaw)
+///  • 2 BlockDisplay entities  – turret box + barrel      (rotate with look.yaw)
+///  • 1 TextDisplay entity     – name tag (billboard)
+///  • 1 TextDisplay entity     – health bar (billboard)
+///  • 1 Marker entity          – camera anchor (above + behind hull)
+///  • 1 ArmorStand entity      – invisible seat inside the hull
 ///
 /// Transformation math
 /// ───────────────────
-/// Minecraft display entity transformation order (rightmost applied first):
-///   world_point = entity_pos + Translation + LeftRotation × (Scale × model_point)
+/// Minecraft: world_point = entity_pos + Translation + LeftRotation × (Scale × model_point)
 ///
-/// Hull parts (hull body + tracks):
-///   LeftRotation = q_hull  (from hull_yaw)
-///   Translation  = q_hull * (centre - scale/2)
-///
-/// Turret parts (turret box + barrel):
-///   LeftRotation = q_turret  (from look.yaw / mouse)
-///   Translation  = q_hull * TURRET_PIVOT + q_turret * (corner - TURRET_PIVOT)
-///   where corner = centre - scale/2  (in hull/turret-local space)
+/// Hull parts:   LeftRotation = q_hull,  Translation = q_hull * (centre − scale/2)
+/// Turret parts: LeftRotation = q_turret, Translation = q_hull*pivot + q_turret*(corner−pivot)
 
-use crate::components::{Dead, Tank, TankVisuals};
+use crate::components::{Dead, PendingCamera, Tank, TankVisuals};
 use crate::config::{BILLBOARD_CENTER, CAM_BEHIND, CAM_HEIGHT, DISPLAY_INTERP_TICKS};
+use valence::entity::armor_stand::{ArmorStandEntityBundle, ArmorStandFlags};
 use valence::entity::block_display::{
     BlockDisplayEntityBundle, BlockState as BlockDisplayBlockState,
 };
@@ -27,6 +25,7 @@ use valence::entity::display::{
     Billboard, InterpolationDuration, LeftRotation, Scale, StartInterpolation, Translation,
     ViewRange,
 };
+use valence::entity::entity::{Flags as EntityFlags, NoGravity};
 use valence::entity::marker::MarkerEntityBundle;
 use valence::entity::text_display::{
     Background as TextBackground, LineWidth, Text as TextDisplayText, TextDisplayEntityBundle,
@@ -35,37 +34,29 @@ use valence::entity::text_display::{
 use valence::entity::{EntityId, EntityLayerId, OldPosition};
 use valence::math::{DVec3, Quat, Vec3};
 use valence::prelude::*;
+use valence::protocol::encode::WritePacket;
 use valence::protocol::packets::play::SetCameraEntityS2c;
 use valence::protocol::VarInt;
-use valence::protocol::encode::WritePacket;
 use valence::text::{Color, IntoText};
 
 // ─── Tank geometry ────────────────────────────────────────────────────────────
 
-/// Hull parts: rotate with hull_yaw.
-/// (local_centre_in_tank_space, scale, block_state)
-/// Tank faces South (+Z) at yaw=0.  X=right, Y=up, Z=forward.
+/// Hull parts – rotate with hull_yaw.  Tank faces South (+Z) at yaw=0.
 const HULL_PARTS: &[([f32; 3], [f32; 3], fn() -> BlockState)] = &[
-    // Hull body
     ([0.0, 0.2, 0.0], [0.85, 0.3, 1.2], || BlockState::GRAY_CONCRETE),
-    // Left track (player-left = -X at yaw=0)
     ([-0.5, 0.15, 0.0], [0.2, 0.3, 1.4], || BlockState::BLACK_CONCRETE),
-    // Right track
     ([0.5, 0.15, 0.0], [0.2, 0.3, 1.4], || BlockState::BLACK_CONCRETE),
 ];
 
-/// Turret parts: rotate independently around TURRET_PIVOT with look.yaw (mouse).
+/// Turret parts – rotate around TURRET_PIVOT with look.yaw (mouse).
 const TURRET_PARTS: &[([f32; 3], [f32; 3], fn() -> BlockState)] = &[
-    // Turret box (on hull top, slightly rearward)
     ([0.0, 0.50, -0.1], [0.55, 0.3, 0.55], || BlockState::WHITE_CONCRETE),
-    // Barrel (extends forward from turret front)
     ([0.0, 0.55, 0.525], [0.12, 0.12, 0.7], || BlockState::WHITE_CONCRETE),
 ];
 
 /// Pivot point in hull-local space around which the turret rotates.
 const TURRET_PIVOT: [f32; 3] = [0.0, 0.55, 0.0];
 
-/// Precompute the corner offset for each part: `centre - scale/2`.
 fn corner(centre: [f32; 3], scale: [f32; 3]) -> Vec3 {
     Vec3::new(
         centre[0] - scale[0] * 0.5,
@@ -76,18 +67,18 @@ fn corner(centre: [f32; 3], scale: [f32; 3]) -> Vec3 {
 
 // ─── Spawn ────────────────────────────────────────────────────────────────────
 
-/// Spawns all Display Entities + camera anchor for a new tank and returns the handle struct.
 pub fn spawn_tank_visuals(
     commands: &mut Commands,
     layer: Entity,
     player_pos: DVec3,
     username: &str,
+    team_color: Color,
 ) -> TankVisuals {
     const VIEW: ViewRange = ViewRange(64.0);
 
-    // ── Hull parts ───────────────────────────────────────────────────────────
+    // Hull parts
     let mut hull_parts = Vec::with_capacity(HULL_PARTS.len());
-    for &(_centre, scale, block_fn) in HULL_PARTS {
+    for &(_c, scale, block_fn) in HULL_PARTS {
         let id = commands
             .spawn(BlockDisplayEntityBundle {
                 position: Position(player_pos),
@@ -103,9 +94,9 @@ pub fn spawn_tank_visuals(
         hull_parts.push(id);
     }
 
-    // ── Turret parts ─────────────────────────────────────────────────────────
+    // Turret parts
     let mut turret_parts = Vec::with_capacity(TURRET_PARTS.len());
-    for &(_centre, scale, block_fn) in TURRET_PARTS {
+    for &(_c, scale, block_fn) in TURRET_PARTS {
         let id = commands
             .spawn(BlockDisplayEntityBundle {
                 position: Position(player_pos),
@@ -121,14 +112,14 @@ pub fn spawn_tank_visuals(
         turret_parts.push(id);
     }
 
-    // ── Name tag (billboard, always faces viewer) ─────────────────────────
+    // Name tag
     let name_owned = username.to_owned();
     let name_tag = commands
         .spawn(TextDisplayEntityBundle {
             position: Position(player_pos + DVec3::new(0.0, 2.0, 0.0)),
             layer: EntityLayerId(layer),
             text_display_text: TextDisplayText(
-                name_owned.into_text().bold().color(Color::WHITE),
+                name_owned.into_text().bold().color(team_color),
             ),
             display_billboard: Billboard(BILLBOARD_CENTER),
             display_scale: Scale(Vec3::splat(0.55)),
@@ -140,7 +131,7 @@ pub fn spawn_tank_visuals(
         })
         .id();
 
-    // ── Health bar ────────────────────────────────────────────────────────
+    // Health bar
     let health_bar = commands
         .spawn(TextDisplayEntityBundle {
             position: Position(player_pos + DVec3::new(0.0, 1.65, 0.0)),
@@ -156,12 +147,29 @@ pub fn spawn_tank_visuals(
         })
         .id();
 
-    // ── Camera anchor (Marker entity – invisible, just a position) ────────
+    // Camera anchor – invisible Marker entity above+behind the tank
     let cam_pos = player_pos + DVec3::new(0.0, CAM_HEIGHT, -CAM_BEHIND);
     let camera_anchor = commands
         .spawn(MarkerEntityBundle {
             position: Position(cam_pos),
             layer: EntityLayerId(layer),
+            ..Default::default()
+        })
+        .id();
+
+    // Invisible armor-stand seat hidden inside the hull.
+    // Other clients see the player "seated" here; the player's own camera
+    // is at the camera_anchor above the tank.
+    let mut seat_flags = EntityFlags::default();
+    seat_flags.set_invisible(true);
+    let seat = commands
+        .spawn(ArmorStandEntityBundle {
+            position: Position(player_pos),
+            layer: EntityLayerId(layer),
+            entity_flags: seat_flags,
+            // 0x10 = Marker flag → no hit-box, no physics
+            armor_stand_armor_stand_flags: ArmorStandFlags(0x10),
+            entity_no_gravity: NoGravity(true),
             ..Default::default()
         })
         .id();
@@ -172,36 +180,48 @@ pub fn spawn_tank_visuals(
         name_tag,
         health_bar,
         camera_anchor,
+        seat,
     }
 }
 
-// ─── Camera setup (runs once per player after TankVisuals is attached) ────────
+// ─── Camera setup (once per player) ──────────────────────────────────────────
 
-/// Sends the SetCamera packet once so each client views the world from their
-/// camera anchor entity instead of their own eyes.
+/// Inserts a PendingCamera countdown so the camera packet is sent a few ticks
+/// after joining — guaranteeing the anchor entity spawn has reached the client.
 pub fn setup_camera(
-    mut players: Query<(&mut Client, &TankVisuals), Added<TankVisuals>>,
+    mut commands: Commands,
+    new_players: Query<Entity, Added<TankVisuals>>,
+) {
+    for entity in &new_players {
+        commands.entity(entity).insert(PendingCamera(4));
+    }
+}
+
+/// Counts down PendingCamera each tick and sends SetCameraEntityS2c on zero.
+pub fn tick_pending_camera(
+    mut commands: Commands,
+    mut players: Query<(Entity, &mut Client, &TankVisuals, &mut PendingCamera)>,
     anchor_ids: Query<&EntityId>,
 ) {
-    for (mut client, visuals) in &mut players {
-        if let Ok(anchor_id) = anchor_ids.get(visuals.camera_anchor) {
-            client.write_packet(&SetCameraEntityS2c {
-                entity_id: VarInt(anchor_id.get()),
-            });
+    for (entity, mut client, visuals, mut pending) in &mut players {
+        if pending.0 == 0 {
+            if let Ok(anchor_id) = anchor_ids.get(visuals.camera_anchor) {
+                client.write_packet(&SetCameraEntityS2c {
+                    entity_id: VarInt(anchor_id.get()),
+                });
+            }
+            commands.entity(entity).remove::<PendingCamera>();
+        } else {
+            pending.0 -= 1;
         }
     }
 }
 
 // ─── Per-tick update ──────────────────────────────────────────────────────────
 
-/// Moves and rotates every tank's display entities and the camera anchor to
-/// match the player position and look direction, and refreshes the health bar.
 pub fn update_tank_visuals(
-    // Alive players (mutable Tank to update hull_yaw)
     mut alive: Query<(&TankVisuals, &Position, &OldPosition, &Look, &mut Tank), Without<Dead>>,
-    // Dead players (hide underground)
     dead: Query<&TankVisuals, With<Dead>>,
-    // Mutable access to display entity components (never have Tank component)
     mut display: Query<
         (
             &mut Position,
@@ -212,72 +232,66 @@ pub fn update_tank_visuals(
         Without<Tank>,
     >,
 ) {
-    // ── Alive tanks ──────────────────────────────────────────────────────────
     for (visuals, player_pos, old_pos, look, mut tank) in &mut alive {
-        // ── Update hull_yaw from horizontal movement direction ─────────────
+        // Hull yaw from horizontal movement delta
         let delta = player_pos.0 - old_pos.get();
         let horiz = DVec3::new(delta.x, 0.0, delta.z);
         if horiz.length_squared() > 1e-6 {
-            // atan2(-dx, dz) gives 0 when moving South (+Z), positive CCW (West)
-            // – same convention as Minecraft's yaw
             tank.hull_yaw = f64::atan2(-delta.x, delta.z).to_degrees() as f32;
         }
 
-        // ── Rotation quaternions ──────────────────────────────────────────
         let q_hull = Quat::from_rotation_y(-tank.hull_yaw.to_radians());
         let q_turret = Quat::from_rotation_y(-(look.yaw.to_radians()));
         let turret_pivot = Vec3::new(TURRET_PIVOT[0], TURRET_PIVOT[1], TURRET_PIVOT[2]);
 
-        // ── Hull parts (hull body + tracks) ───────────────────────────────
-        for (i, &part_entity) in visuals.hull_parts.iter().enumerate() {
-            if let Ok((mut pos, Some(mut trans), Some(mut left_rot), _)) =
-                display.get_mut(part_entity)
-            {
+        // Hull parts
+        for (i, &part) in visuals.hull_parts.iter().enumerate() {
+            if let Ok((mut pos, Some(mut trans), Some(mut lr), _)) = display.get_mut(part) {
                 pos.0 = player_pos.0;
-                let (centre, scale, _) = HULL_PARTS[i];
-                trans.0 = q_hull * corner(centre, scale);
-                left_rot.0 = q_hull;
+                let (c, s, _) = HULL_PARTS[i];
+                trans.0 = q_hull * corner(c, s);
+                lr.0 = q_hull;
             }
         }
 
-        // ── Turret parts (turret box + barrel) ────────────────────────────
+        // Turret parts
         let pivot_world = q_hull * turret_pivot;
-        for (i, &part_entity) in visuals.turret_parts.iter().enumerate() {
-            if let Ok((mut pos, Some(mut trans), Some(mut left_rot), _)) =
-                display.get_mut(part_entity)
-            {
+        for (i, &part) in visuals.turret_parts.iter().enumerate() {
+            if let Ok((mut pos, Some(mut trans), Some(mut lr), _)) = display.get_mut(part) {
                 pos.0 = player_pos.0;
-                let (centre, scale, _) = TURRET_PARTS[i];
-                // Corner in local space, measured from turret pivot
-                let corner_from_pivot = corner(centre, scale) - turret_pivot;
-                // Pivot follows hull; corner rotates with turret
+                let (c, s, _) = TURRET_PARTS[i];
+                let corner_from_pivot = corner(c, s) - turret_pivot;
                 trans.0 = pivot_world + q_turret * corner_from_pivot;
-                left_rot.0 = q_turret;
+                lr.0 = q_turret;
             }
         }
 
-        // ── Name tag (above tank, billboard) ─────────────────────────────
+        // Name tag
         if let Ok((mut pos, _, _, _)) = display.get_mut(visuals.name_tag) {
             pos.0 = player_pos.0 + DVec3::new(0.0, 2.0, 0.0);
         }
 
-        // ── Health bar ────────────────────────────────────────────────────
+        // Health bar
         if let Ok((mut pos, _, _, Some(mut text))) = display.get_mut(visuals.health_bar) {
             pos.0 = player_pos.0 + DVec3::new(0.0, 1.65, 0.0);
             text.0 = health_text(tank.health / tank.max_health);
         }
 
-        // ── Camera anchor (above + behind hull) ───────────────────────────
+        // Camera anchor – above + behind hull
         if let Ok((mut pos, _, _, _)) = display.get_mut(visuals.camera_anchor) {
-            // Behind = -Z in hull local space; up = +Y
             let cam_local = Vec3::new(0.0, CAM_HEIGHT as f32, -(CAM_BEHIND as f32));
             let cam_world = q_hull * cam_local;
             pos.0 = player_pos.0
                 + DVec3::new(cam_world.x as f64, cam_world.y as f64, cam_world.z as f64);
         }
+
+        // Seat armor-stand – inside the hull centre
+        if let Ok((mut pos, _, _, _)) = display.get_mut(visuals.seat) {
+            pos.0 = player_pos.0;
+        }
     }
 
-    // ── Dead tanks – sink underground so they disappear ───────────────────
+    // Dead tanks – sink underground
     for visuals in &dead {
         for &part in visuals.hull_parts.iter().chain(visuals.turret_parts.iter()) {
             if let Ok((mut pos, _, _, _)) = display.get_mut(part) {
@@ -289,13 +303,14 @@ pub fn update_tank_visuals(
                 pos.0.y = -200.0;
             }
         }
-        // Camera anchor stays at player position (dead players can still look around)
+        if let Ok((mut pos, _, _, _)) = display.get_mut(visuals.seat) {
+            pos.0.y = -200.0;
+        }
     }
 }
 
 // ─── Cleanup on disconnect ────────────────────────────────────────────────────
 
-/// Despawns display entities and camera anchor when a player leaves.
 pub fn cleanup_tank_visuals(
     mut commands: Commands,
     mut removed: RemovedComponents<Client>,
@@ -304,19 +319,19 @@ pub fn cleanup_tank_visuals(
     for entity in removed.iter() {
         if let Ok(vis) = visuals.get(entity) {
             for &part in vis.hull_parts.iter().chain(vis.turret_parts.iter()) {
-                commands.entity(part).despawn();
+                commands.entity(part).insert(Despawned);
             }
-            commands.entity(vis.name_tag).despawn();
-            commands.entity(vis.health_bar).despawn();
-            commands.entity(vis.camera_anchor).despawn();
+            commands.entity(vis.name_tag).insert(Despawned);
+            commands.entity(vis.health_bar).insert(Despawned);
+            commands.entity(vis.camera_anchor).insert(Despawned);
+            commands.entity(vis.seat).insert(Despawned);
         }
     }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Renders a 10-segment Unicode block bar coloured by health percentage.
-fn health_text(pct: f32) -> valence::text::Text {
+pub fn health_text(pct: f32) -> valence::text::Text {
     let filled = (pct.clamp(0.0, 1.0) * 10.0).round() as usize;
     let empty = 10 - filled;
     let color = if pct > 0.6 {

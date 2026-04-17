@@ -28,8 +28,10 @@ pub fn handle_respawn(
         let remaining = dead_state.respawn_at.saturating_duration_since(now);
         if remaining.is_zero() {
             tank.health = TANK_MAX_HEALTH;
+            tank.hull_yaw = 0.0;
             pos.0 = random_spawn_pos();
             commands.entity(entity).remove::<Dead>();
+            commands.entity(entity).remove::<crate::components::FlagCarrier>();
             client.send_chat_message("§a§l↑ Respawned!");
         } else if remaining.subsec_millis() > 950 {
             client.send_chat_message(format!("§7Respawning in §f{}§7…", remaining.as_secs() + 1));

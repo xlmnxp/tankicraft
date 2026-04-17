@@ -28,6 +28,14 @@ pub const DISPLAY_INTERP_TICKS: i32 = 3;
 
 // ─── Camera ───────────────────────────────────────────────────────────────────
 /// How many blocks above the player the camera anchor sits
-pub const CAM_HEIGHT: f64 = 7.0;
+pub const CAM_HEIGHT: f64 = 14.0;
 /// How many blocks behind the hull (in hull-local -Z) the camera anchor sits
-pub const CAM_BEHIND: f64 = 9.0;
+pub const CAM_BEHIND: f64 = 2.0;
+
+// ─── CTF ──────────────────────────────────────────────────────────────────────
+pub const RED_BASE: [f64; 3] = [-30.0, 65.0, -30.0];
+pub const BLUE_BASE: [f64; 3] = [30.0, 65.0, 30.0];
+pub const FLAG_PICKUP_RADIUS: f64 = 2.0;
+pub const FLAG_CAPTURE_RADIUS: f64 = 3.0;
+/// How many ticks between score-bar broadcasts (10 = twice per second; fast enough to flash)
+pub const SCORE_BROADCAST_TICKS: u32 = 10;
