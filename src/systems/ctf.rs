@@ -6,9 +6,11 @@
 
 use crate::components::{Dead, Flag, FlagCarrier, Tank, Team, TeamScores};
 use crate::config::{
-    BLUE_BASE, FLAG_CAPTURE_RADIUS, FLAG_PICKUP_RADIUS, RED_BASE, SCORE_BROADCAST_TICKS,
+    BLUE_BASE, FLAG_CAPTURE_RADIUS, FLAG_DROP_PICKUP_COOLDOWN_SECS, FLAG_PICKUP_RADIUS, RED_BASE,
+    SCORE_BROADCAST_TICKS,
 };
 use std::borrow::Cow;
+use std::time::{Duration, Instant};
 use valence::entity::block_display::{
     BlockDisplayEntityBundle, BlockState as BlockDisplayBlockState,
 };
@@ -92,6 +94,9 @@ fn spawn_flag(commands: &mut Commands, layer: Entity, team: Team, base_pos: DVec
         base_pos,
         carrier: None,
         part_entities,
+        dropped_pos: None,
+        dropped_at: None,
+        dropped_by: None,
     });
 }
 
@@ -108,25 +113,38 @@ pub fn update_ctf(
     mut part_positions: Query<&mut Position, Without<Tank>>,
     mut scores: ResMut<TeamScores>,
 ) {
-    // ── Snapshot flag states (entity, team, carrier, current root) ────────────
-    let snap: Vec<(Entity, Team, Option<Entity>, DVec3)> = flags
+    // ── Return dropped flags to base after 15 seconds ─────────────────────────
+    for (_, mut flag) in &mut flags {
+        if flag.carrier.is_none() {
+            if let (Some(dropped_at), Some(_)) = (flag.dropped_at, flag.dropped_pos) {
+                if dropped_at.elapsed() >= Flag::RETURN_DELAY {
+                    flag.dropped_pos = None;
+                    flag.dropped_at = None;
+                    flag.dropped_by = None;
+                }
+            }
+        }
+    }
+
+    // ── Snapshot: (flag_e, team, carrier, root, dropped_pos, dropped_by, dropped_at) ─
+    let snap: Vec<(Entity, Team, Option<Entity>, DVec3, Option<DVec3>, Option<Entity>, Option<Instant>)> = flags
         .iter()
         .map(|(flag_e, flag)| {
             let root = flag
                 .carrier
                 .and_then(|e| carrier_pos.get(e).ok())
                 .map(|p| p.0)
-                .unwrap_or(flag.base_pos);
-            (flag_e, flag.team, flag.carrier, root)
+                .unwrap_or_else(|| flag.dropped_pos.unwrap_or(flag.base_pos));
+            (flag_e, flag.team, flag.carrier, root, flag.dropped_pos, flag.dropped_by, flag.dropped_at)
         })
         .collect();
 
     // Which flags are currently in flight?
-    let red_flag_carried = snap.iter().any(|(_, t, c, _)| *t == Team::Red && c.is_some());
-    let blue_flag_carried = snap.iter().any(|(_, t, c, _)| *t == Team::Blue && c.is_some());
+    let red_flag_carried = snap.iter().any(|(_, t, c, _, _, _, _)| *t == Team::Red && c.is_some());
+    let blue_flag_carried = snap.iter().any(|(_, t, c, _, _, _, _)| *t == Team::Blue && c.is_some());
 
     // ── Move flag visuals ─────────────────────────────────────────────────────
-    for &(flag_e, _, _, root) in &snap {
+    for &(flag_e, _, _, root, _, _, _) in &snap {
         if let Ok((_, flag)) = flags.get(flag_e) {
             for &part in &flag.part_entities {
                 if let Ok(mut p) = part_positions.get_mut(part) {
@@ -139,6 +157,7 @@ pub fn update_ctf(
     // ── Collect player actions ────────────────────────────────────────────────
     let mut pickups: Vec<(Entity, Entity, Team, DVec3)> = vec![]; // (player, flag_e, flag_team, player_pos)
     let mut captures: Vec<(Entity, Entity)> = vec![];             // (player, flag_e)
+    let mut returns: Vec<Entity> = vec![];                        // flag_e to return to base
 
     for (player_e, player_pos, &player_team, carrier_opt, mut tank, mut client) in &mut players {
         // Score bar (throttled, with flashing flag indicators)
@@ -190,14 +209,26 @@ pub fn update_ctf(
                 ));
             }
         } else {
-            // Check pickup of uncarried enemy flag
-            for &(flag_e, flag_team, flag_carrier, flag_root) in &snap {
-                if flag_team == player_team || flag_carrier.is_some() {
+            for &(flag_e, flag_team, flag_carrier, flag_root, flag_dropped_pos, flag_dropped_by, flag_dropped_at) in &snap {
+                if flag_carrier.is_some() {
                     continue;
                 }
-                if (player_pos.0 - flag_root).length() < FLAG_PICKUP_RADIUS {
+                if (player_pos.0 - flag_root).length() >= FLAG_PICKUP_RADIUS {
+                    continue;
+                }
+
+                if flag_team != player_team {
+                    // Dropper cooldown — same player cannot immediately re-pick their own drop
+                    let in_cooldown = flag_dropped_by == Some(player_e)
+                        && flag_dropped_at.map_or(false, |t| {
+                            t.elapsed() < Duration::from_secs(FLAG_DROP_PICKUP_COOLDOWN_SECS)
+                        });
+                    if in_cooldown {
+                        break;
+                    }
+
+                    // Enemy flag — pick it up
                     pickups.push((player_e, flag_e, flag_team, player_pos.0));
-                    // Pickup sound + message
                     client.play_sound(
                         Sound::EntityExperienceOrbPickup,
                         SoundCategory::Master,
@@ -206,8 +237,19 @@ pub fn update_ctf(
                         0.8,
                     );
                     client.send_chat_message("§e§l⚑ Flag picked up! Return to your base!");
-                    break;
+                } else if flag_dropped_pos.is_some() {
+                    // Own team's dropped flag — return it to base
+                    returns.push(flag_e);
+                    client.play_sound(
+                        Sound::BlockEnderChestOpen,
+                        SoundCategory::Master,
+                        player_pos.0,
+                        1.0,
+                        1.2,
+                    );
+                    client.send_chat_message("§a⚑ Flag returned to base!");
                 }
+                break;
             }
         }
     }
@@ -218,6 +260,9 @@ pub fn update_ctf(
         if let Ok((_, mut flag)) = flags.get_mut(flag_e) {
             let base = flag.base_pos;
             flag.carrier = None;
+            flag.dropped_pos = None;
+            flag.dropped_at = None;
+            flag.dropped_by = None;
             for &part in &flag.part_entities {
                 if let Ok(mut p) = part_positions.get_mut(part) {
                     p.0 = base;
@@ -231,10 +276,28 @@ pub fn update_ctf(
         if let Ok((_, mut flag)) = flags.get_mut(flag_e) {
             if flag.carrier.is_none() {
                 flag.carrier = Some(player_e);
+                flag.dropped_pos = None;
+                flag.dropped_at = None;
+                flag.dropped_by = None;
                 commands.entity(player_e).insert(FlagCarrier {
                     flag_entity: flag_e,
                     flag_team,
                 });
+            }
+        }
+    }
+
+    // ── Apply same-team flag returns ──────────────────────────────────────────
+    for flag_e in returns {
+        if let Ok((_, mut flag)) = flags.get_mut(flag_e) {
+            let base = flag.base_pos;
+            flag.dropped_pos = None;
+            flag.dropped_at = None;
+            flag.dropped_by = None;
+            for &part in &flag.part_entities {
+                if let Ok(mut p) = part_positions.get_mut(part) {
+                    p.0 = base;
+                }
             }
         }
     }
@@ -260,11 +323,14 @@ pub fn drop_flag_on_sneak(
         if just_pressed {
             if let Some(fc) = carrier_opt {
                 if let Ok(mut flag) = flags.get_mut(fc.flag_entity) {
-                    let base = flag.base_pos;
+                    let drop_pos = player_pos.0;
                     flag.carrier = None;
+                    flag.dropped_pos = Some(drop_pos);
+                    flag.dropped_at = Some(Instant::now());
+                    flag.dropped_by = Some(player_e);
                     for &part in &flag.part_entities {
                         if let Ok(mut p) = part_positions.get_mut(part) {
-                            p.0 = base;
+                            p.0 = drop_pos;
                         }
                     }
                 }
@@ -276,7 +342,7 @@ pub fn drop_flag_on_sneak(
                     1.0,
                     1.2,
                 );
-                client.send_chat_message("§7⚑ Flag dropped.");
+                client.send_chat_message("§7⚑ Flag dropped. Returns to base in 15 seconds if unclaimed.");
             }
         }
     }

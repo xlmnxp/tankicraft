@@ -155,17 +155,39 @@ pub fn update_bullets(
     }
 }
 
-/// When a carrier is killed, drop the flag back to its base.
+/// When a carrier is killed, drop the flag at the death position with a 15-second return timer.
 pub fn drop_flag_on_kill(
     mut commands: Commands,
-    newly_dead: Query<(Entity, &FlagCarrier), Added<Dead>>,
-    mut flags: Query<(&mut crate::components::Flag, &mut Position)>,
+    mut queries: ParamSet<(
+        Query<(Entity, &FlagCarrier, &Position), Added<Dead>>,
+        Query<&mut Position, Without<crate::components::Tank>>,
+    )>,
+    mut flags: Query<&mut crate::components::Flag>,
 ) {
-    for (player_entity, carrier) in &newly_dead {
-        if let Ok((mut flag, mut flag_pos)) = flags.get_mut(carrier.flag_entity) {
-            flag_pos.0 = flag.base_pos;
+    // Collect dead carrier data before borrowing part_positions mutably.
+    let dead_carriers: Vec<(Entity, Entity, DVec3)> = queries
+        .p0()
+        .iter()
+        .map(|(e, fc, pos)| (e, fc.flag_entity, pos.0))
+        .collect();
+
+    for (player_entity, flag_entity, drop_pos) in dead_carriers {
+        let part_entities: Vec<Entity> = if let Ok(mut flag) = flags.get_mut(flag_entity) {
             flag.carrier = None;
+            flag.dropped_pos = Some(drop_pos);
+            flag.dropped_at = Some(Instant::now());
+            flag.dropped_by = Some(player_entity);
+            flag.part_entities.clone()
+        } else {
+            vec![]
+        };
+
+        for part in part_entities {
+            if let Ok(mut p) = queries.p1().get_mut(part) {
+                p.0 = drop_pos;
+            }
         }
+
         commands.entity(player_entity).remove::<FlagCarrier>();
     }
 }

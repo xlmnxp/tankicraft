@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use valence::math::DVec3;
 use valence::prelude::*;
 
@@ -91,10 +91,20 @@ pub struct TankVisuals {
 pub struct Flag {
     pub team: Team,
     pub base_pos: DVec3,
-    /// Which player is currently carrying this flag (None = at base).
+    /// Which player is currently carrying this flag (None = at base or dropped).
     pub carrier: Option<Entity>,
     /// [stand, pole, cloth] Block Display entity handles.
     pub part_entities: Vec<Entity>,
+    /// World position where the flag was shift-dropped (None = at base or carried).
+    pub dropped_pos: Option<DVec3>,
+    /// Instant the flag was dropped; drives the 15-second return-to-base timer.
+    pub dropped_at: Option<Instant>,
+    /// Player who last dropped the flag; they cannot pick it up during the cooldown window.
+    pub dropped_by: Option<Entity>,
+}
+
+impl Flag {
+    pub const RETURN_DELAY: Duration = Duration::from_secs(15);
 }
 
 /// Added to a player while they carry the enemy flag.

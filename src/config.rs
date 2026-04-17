@@ -39,3 +39,5 @@ pub const FLAG_PICKUP_RADIUS: f64 = 2.0;
 pub const FLAG_CAPTURE_RADIUS: f64 = 3.0;
 /// How many ticks between score-bar broadcasts (10 = twice per second; fast enough to flash)
 pub const SCORE_BROADCAST_TICKS: u32 = 10;
+/// Seconds after dropping the flag before the dropper can pick it up again
+pub const FLAG_DROP_PICKUP_COOLDOWN_SECS: u64 = 4;
